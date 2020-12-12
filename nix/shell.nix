@@ -7,7 +7,7 @@ with pkgs;
 mkShell {
   name = "icy_matrix-dev-shell";
   nativeBuildInputs =
-    ([ git niv nixpkgs-fmt crate2nix cargo clippy rustc rustfmt ])
+    ([ git niv nixpkgs-fmt crate2nix cargo cargo-watch clippy rustc rustfmt ])
     ++ crateNativeBuildInputs;
   buildInputs = crateBuildInputs;
   shellHook = ''

@@ -13,6 +13,8 @@ pub enum ClientError {
     Internal(ruma_client::Error<ruma::api::client::Error>),
     /// The user is already logged in.
     AlreadyLoggedIn,
+    /// The user is not logged in.
+    NotLoggedIn,
     /// Not all required login information was provided.
     MissingLoginInfo,
     /// Custom error
@@ -26,6 +28,7 @@ impl Clone for ClientError {
         match self {
             AlreadyLoggedIn => AlreadyLoggedIn,
             MissingLoginInfo => MissingLoginInfo,
+            NotLoggedIn => NotLoggedIn,
             Custom(err) => Custom(err.clone()),
             _ => Custom(self.to_string()),
         }
@@ -99,7 +102,8 @@ impl Display for ClientError {
                 write!(fmt, "An internal error occurred: {}", err.to_string())
             }
             ClientError::IOError(err) => write!(fmt, "An IO error occurred: {}", err),
-            ClientError::AlreadyLoggedIn => write!(fmt, "Already logged in with another user."),
+            ClientError::AlreadyLoggedIn => write!(fmt, "Already logged in as another user."),
+            ClientError::NotLoggedIn => write!(fmt, "Not logged in."),
             ClientError::MissingLoginInfo => {
                 write!(fmt, "Missing required login information, can't login.")
             }

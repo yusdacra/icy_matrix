@@ -36,23 +36,19 @@ use std::{
     convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
     time::Duration,
+    path::PathBuf,
 };
 pub use timeline_event::TimelineEvent;
 use uuid::Uuid;
+use crate::{backend::{Backend, Action, Reaction, ActionContent, ReactionContent}, content::ContentStore};
+use tokio::sync::mpsc::{channel, Sender, Receiver};
 
 pub mod error;
-pub mod media;
 pub mod member;
 pub mod room;
 pub mod timeline_event;
 
-#[macro_export]
-macro_rules! data_dir {
-    () => {
-        "data/"
-    };
-}
-pub const SESSION_ID_PATH: &str = concat!(data_dir!(), "session");
+pub const SESSION_ID_FILENAME: &str = "session";
 
 #[cfg(target_os = "linux")]
 pub const CLIENT_ID: &str = "icy_matrix Linux";
@@ -122,24 +118,73 @@ pub struct Client {
     /* The inner client stores the session (with our requirements,
     since we only allow `Client` creation when they are met),
     so we don't need to store it here again. */
-    inner: InnerClient,
+    inner: Option<InnerClient>,
     rooms: Rooms,
     next_batch: Option<String>,
+    session_file_path: PathBuf,
+    uuid: Uuid,
+    action_channel: Receiver<Action>,
+    reaction_channel: Sender<Reaction>,
 }
 
 impl Debug for Client {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Client")
-            .field("user_id", &self.current_user_id().to_string())
+            .field("user_id", &self.current_user_id())
             .finish()
     }
 }
 
-impl Client {
-    pub async fn new(homeserver: &str, username: &str, password: &str) -> ClientResult<Self> {
-        // Make sure the data/content directory exists
-        tokio::fs::create_dir_all(format!("{}content", data_dir!())).await?;
+impl Backend for Client {
+    fn name() -> &'static str {
+        "Matrix"
+    }
 
+    fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    fn spawn(self) -> (Sender<Action>, Receiver<Reaction>) {
+        let (act_send, act_recv) = channel(1024);
+        let (rec_send, rec_recv) = channel(1024);
+
+        self.action_channel = act_recv;
+        self.reaction_channel = rec_send;
+
+        std::thread::spawn(move || {
+            let client = self;
+
+            while let Ok(item) =  {
+
+            }
+        });
+
+        (act_send, rec_recv)
+    }
+}
+
+impl Client {
+    pub fn new(content_store: &ContentStore) -> Self {
+        Self {
+            inner: None,
+            rooms: Rooms::new(),
+            next_batch: None,
+            session_file_path: content_store.app_dirs().data_dir().join(SESSION_ID_FILENAME),
+        }
+    }
+
+    pub fn login_with_session(&mut self, session: Session) -> ClientResult<()> {
+        let homeserver = format!("https://{}", session.user_id.server_name());
+        let homeserver_url = homeserver
+            .parse::<Uri>()
+            .map_err(|e| ClientError::URLParse(homeserver, e))?;
+
+        self.inner = Some(InnerClient::new(homeserver_url, Some(session.into())));
+
+        Ok(())
+    }
+    
+    pub async fn login(&mut self, homeserver: &str, username: &str, password: &str) -> ClientResult<()> {
         let homeserver_url = homeserver
             .parse::<Uri>()
             .map_err(|e| ClientError::URLParse(homeserver.to_owned(), e))?;
@@ -147,7 +192,7 @@ impl Client {
         let inner = InnerClient::new(homeserver_url, None);
 
         let mut device_id = None;
-        if let Ok(s) = tokio::fs::read_to_string(SESSION_ID_PATH).await {
+        if let Ok(s) = tokio::fs::read_to_string(&self.session_file_path).await {
             if let Ok(session) = toml::from_str::<Session>(&s) {
                 device_id = Some(session.device_id);
             }
@@ -164,13 +209,13 @@ impl Client {
         // Save the session
         if let Ok(encoded_session) = toml::to_vec(&session) {
             // Do not abort the sync if we can't save the session data
-            if let Err(err) = tokio::fs::write(SESSION_ID_PATH, encoded_session).await {
+            if let Err(err) = tokio::fs::write(&self.session_file_path, encoded_session).await {
                 log::error!("Could not save session data: {}", err);
             } else {
                 use std::os::unix::fs::PermissionsExt;
 
                 if let Err(err) = tokio::fs::set_permissions(
-                    SESSION_ID_PATH,
+                    &self.session_file_path,
                     std::fs::Permissions::from_mode(0o600),
                 )
                 .await
@@ -180,48 +225,29 @@ impl Client {
             }
         }
 
-        Ok(Self {
-            inner,
-            rooms: Rooms::new(),
-            next_batch: None,
-        })
-    }
-
-    pub fn new_with_session(session: Session) -> ClientResult<Self> {
-        // Make sure the data/content directory exists
-        std::fs::create_dir_all(format!("{}content", data_dir!()))?;
-
-        let homeserver = format!("https://{}", session.user_id.server_name());
-        let homeserver_url = homeserver
-            .parse::<Uri>()
-            .map_err(|e| ClientError::URLParse(homeserver, e))?;
-
-        let inner = InnerClient::new(homeserver_url, Some(session.into()));
-
-        Ok(Self {
-            inner,
-            rooms: Rooms::new(),
-            next_batch: None,
-        })
-    }
-
-    pub async fn logout(inner: InnerClient) -> ClientResult<()> {
-        inner.request(logout::Request::new()).await?;
-
-        tokio::fs::remove_file(SESSION_ID_PATH).await?;
+        self.inner = Some(inner);
 
         Ok(())
     }
 
-    pub fn current_user_id(&self) -> UserId {
-        self.inner
+    // This function does not modify any data *in memory*, but since it modifies the session file it requires a `&mut self`.
+    pub async fn logout(&mut self, inner: InnerClient, content_store: &ContentStore) -> ClientResult<()> {
+        inner.request(logout::Request::new()).await?;
+
+        tokio::fs::remove_file(&self.session_file_path).await?;
+
+        Ok(())
+    }
+
+    pub fn current_user_id(&self) -> ClientResult<UserId> {
+        Ok(self.inner()?
             .session()
             // This unwrap is safe since we check if there is a session beforehand
             .unwrap()
             .identification
             // This unwrap is safe since we check if there is a user_id beforehand
             .unwrap()
-            .user_id
+            .user_id)
     }
 
     pub fn next_batch(&self) -> Option<String> {
@@ -232,7 +258,7 @@ impl Client {
         let lazy_load_filter = Client::member_lazy_load_sync_filter();
 
         let initial_sync_response = self
-            .inner
+            .inner()?
             .request(assign!(sync_events::Request::new(), {
                 filter: Some(
                     // Lazy load room members here to ensure a fast login
@@ -268,8 +294,8 @@ impl Client {
         )
     }
 
-    pub fn inner(&self) -> InnerClient {
-        self.inner.clone()
+    pub fn inner(&self) -> ClientResult<InnerClient> {
+        self.inner.map_or(Err(ClientError::NotLoggedIn), Ok)
     }
 
     pub fn rooms(&self) -> &Rooms {
@@ -420,7 +446,7 @@ impl Client {
     pub fn process_events_around_response(
         &mut self,
         response: get_context::Response,
-    ) -> Vec<(bool, Uri)> {
+    ) -> Vec<Uri> {
         let mut thumbnails = vec![];
 
         let get_context::Response {
@@ -463,7 +489,7 @@ impl Client {
                     thumbnails = events_after
                         .iter()
                         .chain(events_before.iter())
-                        .flat_map(|tevent| tevent.download_or_read_thumbnail())
+                        .flat_map(|tevent| tevent.thumbnail_url_or_image_url())
                         .collect::<Vec<_>>();
                     room.add_chunk_of_events(events_before, events_after, &event_id);
                 }
@@ -472,7 +498,7 @@ impl Client {
         thumbnails
     }
 
-    pub fn process_sync_response(&mut self, response: sync_events::Response) -> Vec<(bool, Uri)> {
+    pub fn process_sync_response(&mut self, response: sync_events::Response) -> Vec<Uri> {
         let mut thumbnails = vec![];
 
         for (room_id, joined_room) in response.rooms.join {
@@ -544,8 +570,8 @@ impl Client {
                     room.ack_event(&transaction_id);
                 }
                 room.redact_event(&tevent);
-                if let Some(thumbnail_data) = tevent.download_or_read_thumbnail() {
-                    thumbnails.push(thumbnail_data);
+                if let Some(thumbnail_url) = tevent.thumbnail_url_or_image_url() {
+                    thumbnails.push(thumbnail_url);
                 }
 
                 room.add_event(tevent);

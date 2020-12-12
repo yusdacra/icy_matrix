@@ -1,7 +1,7 @@
-use ruma::{api::exports::http::Uri, identifiers::UserId};
+use http::Uri;
 use std::time::Instant;
 
-pub type Members = ahash::AHashMap<UserId, Member>;
+pub type Members = ahash::AHashMap<ruma::UserId, Member>;
 
 pub struct Member {
     avatar_url: Option<Uri>,
@@ -34,7 +34,7 @@ impl Member {
         self.display_name.as_deref()
     }
 
-    pub fn display(&self) -> bool {
+    pub fn should_display(&self) -> bool {
         self.display_user
     }
 

@@ -1,4 +1,5 @@
-use super::{media::content_exists, media::ContentType, room::Room};
+use super::room::Room;
+use crate::content::ContentType;
 use ruma::{
     api::exports::http::Uri,
     events::{
@@ -274,29 +275,17 @@ impl TimelineEvent {
         None
     }
 
-    pub fn download_or_read_thumbnail(&self) -> Option<(bool, Uri)> {
+    pub fn thumbnail_url_or_image_url(&self) -> Option<Uri> {
         if let Some(thumbnail_url) = self.thumbnail_url() {
-            Some((
-                if content_exists(&thumbnail_url) {
-                    true
-                } else {
-                    false
-                },
-                thumbnail_url,
-            ))
+            return Some(thumbnail_url);
         } else if let (Some(ContentType::Image), Some(content_size), Some(content_url)) =
             (self.content_type(), self.content_size(), self.content_url())
         {
-            if content_exists(&content_url) {
-                Some((true, content_url))
-            } else if content_size < 1000 * 1000 {
-                Some((false, content_url))
-            } else {
-                None
+            if content_size < 1000 * 1000 {
+                return Some(content_url);
             }
-        } else {
-            None
         }
+        None
     }
 
     /// Check if we should show this event to the user.

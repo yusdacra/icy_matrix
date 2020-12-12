@@ -5,11 +5,21 @@ authors = ["Yusuf Bera Ertan <y.bera003.06@protonmail.com>"]
 edition = "2018"
 
 [profile.dev]
-opt-level = 1
+opt-level = 2
+panic = "abort"
+debug = false
+debug-assertions = true
+overflow-checks = true
+codegen-units = 8
+lto = false
+incremental = true
 
 [profile.release]
+opt-level = 3
 lto = "thin"
-panic = "abort"
+debug = false
+overflow-checks = false
+debug-assertions = false
 
 [dependencies]
 iced = { git = "https://github.com/yusdacra/iced", branch = "scrollable_programmatically", features = ["tokio_old", "image"] }
@@ -17,9 +27,12 @@ iced_native = { git = "https://github.com/yusdacra/iced", branch = "scrollable_p
 iced_futures = { git = "https://github.com/yusdacra/iced", branch = "scrollable_programmatically" }
 
 open = "1.4.0"
-infer = { version = "0.3.0", default-features = false }
-rfd = { git = "https://github.com/yusdacra/rfd.git" }
+infer = "0.3.0"
+directories-next = "2.0.0"
+rfd = { git = "https://github.com/PolyMeilex/rfd.git" }
 image = "0.23.11"
+sha3 = "0.9.1"
+hex = "0.4.2"
 
 tokio = { version = "0.2", features = ["rt-core", "parking_lot", "time", "fs"] }
 ruma = { git = "https://github.com/ruma/ruma/", features = ["client-api"], branch = "main" }
@@ -28,6 +41,7 @@ assign = "1.1.0"
 uuid = { version = "0.8.1", features = ["v4"] }
 ahash = "0.6"
 indexmap = "1.6.0"
+http = "0.2"
 
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.5"

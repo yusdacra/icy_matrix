@@ -1,9 +1,7 @@
 use crate::{
-    client::{
-        error::ClientError,
-        media::{self, ContentType, ImageHandle, ThumbnailStore},
-        Client, InnerClient, TimelineEvent,
-    },
+    backend::Backend,
+    frontend::*,
+    content::{self, ContentType, ImageHandle, ThumbnailCache as ThumbnailStore},
     ui::{
         component::{build_event_history, build_room_list, event_history::SHOWN_MSGS_LIMIT},
         style::{
@@ -18,55 +16,46 @@ use iced::{
 };
 use iced_futures::BoxStream;
 use image::GenericImageView;
-use ruma::{
-    api::{
-        client::r0::{context::get_context, sync::sync_events},
-        exports::http::Uri,
-    },
-    events::room::message::FileMessageEventContent,
-    events::room::message::VideoInfo,
-    events::room::message::VideoMessageEventContent,
-    events::room::ThumbnailInfo,
-    events::{
-        room::{
-            message::{
-                AudioInfo, AudioMessageEventContent, FileInfo, ImageMessageEventContent,
-                MessageEventContent,
-            },
-            ImageInfo,
-        },
-        AnySyncRoomEvent,
-    },
-    presence::PresenceState,
-    RoomId,
-};
+// use ruma::{
+//     api::{
+//         client::r0::{context::get_context, sync::sync_events},
+//         exports::http::Uri,
+//     },
+//     events::room::message::FileMessageEventContent,
+//     events::room::message::VideoInfo,
+//     events::room::message::VideoMessageEventContent,
+//     events::room::ThumbnailInfo,
+//     events::{
+//         room::{
+//             message::{
+//                 AudioInfo, AudioMessageEventContent, FileInfo, ImageMessageEventContent,
+//                 MessageEventContent,
+//             },
+//             ImageInfo,
+//         },
+//         AnySyncRoomEvent,
+//     },
+//     presence::PresenceState,
+//     RoomId,
+// };
 use std::{hash::Hash, hash::Hasher, path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
-pub enum Message {
+pub enum UiMessage {
     SendMessage {
-        content: Vec<MessageEventContent>,
-        room_id: RoomId,
+        content: Message,
+        room_id: String,
     },
-    SendMessageResult(RetrySendEventResult),
     /// Sent when the user wants to send a message.
-    SendMessageComposer(RoomId),
+    SendMessageComposer(String),
     /// Sent when the user wants to send a file.
-    SendFile(RoomId),
+    SendFile(String),
     /// Sent when user makes a change to the message they are composing.
     MessageChanged(String),
     ScrollToBottom,
-    OpenContent {
-        content_url: Uri,
-        is_thumbnail: bool,
-    },
-    DownloadedThumbnail {
-        thumbnail_url: Uri,
-        thumbnail: ImageHandle,
-    },
     /// Sent when the user selects a different room.
-    RoomChanged(RoomId),
+    RoomChanged(String),
     /// Sent when the user makes a change to the room search box.
     RoomSearchTextChanged(String),
     /// Sent when the user scrolls the message history.
@@ -77,10 +66,6 @@ pub enum Message {
     /// Sent when the user selects an option from the bottom menu.
     SelectedMenuOption(String),
     LogoutConfirmation(bool),
-    /// Sent when a sync response is received from the server.
-    MatrixSyncResponse(Box<sync_events::Response>),
-    /// Sent when a "get context" (get events around an event) is received from the server.
-    MatrixGetEventsAroundResponse(Box<get_context::Response>),
 }
 
 pub struct MainScreen {
@@ -105,13 +90,19 @@ pub struct MainScreen {
     /// `confirmation` is `true` if the user approves the logout, `false` otherwise.
     logging_out: Option<bool>,
     /// `None` if the user didn't select a room, `Some(room_id)` otherwise.
-    current_room_id: Option<RoomId>,
-    looking_at_event: AHashMap<RoomId, usize>,
+    current_room_id: Option<String>,
+    looking_at_event: AHashMap<String, usize>,
     /// The message the user is currently typing.
     message: String,
     /// Text used to filter rooms.
     room_search_text: String,
     thumbnail_store: ThumbnailStore,
+}
+
+impl Default for MainScreen {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MainScreen {
@@ -133,11 +124,11 @@ impl MainScreen {
             looking_at_event: Default::default(),
             message: Default::default(),
             room_search_text: Default::default(),
-            thumbnail_store: ThumbnailStore::new(),
+            thumbnail_store: Default::default(),
         }
     }
 
-    pub fn logout_screen(&mut self, theme: Theme, confirmation: bool) -> Element<Message> {
+    pub fn logout_screen(&mut self, theme: Theme, confirmation: bool) -> Element<UiMessage> {
         if confirmation {
             Container::new(Text::new("Logging out...").size(30))
                 .center_y()
@@ -152,7 +143,7 @@ impl MainScreen {
                 state: &'a mut button::State,
                 confirm: bool,
                 theme: Theme,
-            ) -> Element<'a, Message> {
+            ) -> Element<'a, UiMessage> {
                 Button::new(
                     state,
                     Container::new(Text::new(if confirm { "Yes" } else { "No" }))
@@ -160,13 +151,13 @@ impl MainScreen {
                         .center_x(),
                 )
                 .width(Length::FillPortion(1))
-                .on_press(Message::LogoutConfirmation(confirm))
+                .on_press(UiMessage::LogoutConfirmation(confirm))
                 .style(theme)
                 .into()
             }
 
             #[inline(always)]
-            fn make_space<'a>(units: u16) -> Element<'a, Message> {
+            fn make_space<'a>(units: u16) -> Element<'a, UiMessage> {
                 Space::with_width(Length::FillPortion(units)).into()
             }
 
@@ -207,7 +198,7 @@ impl MainScreen {
         }
     }
 
-    pub fn view(&mut self, theme: Theme, client: &Client) -> Element<Message> {
+    pub fn view(&mut self, theme: Theme, backend: &dyn Backend) -> Element<UiMessage> {
         if let Some(confirmation) = self.logging_out {
             return self.logout_screen(theme, confirmation);
         }
@@ -234,7 +225,7 @@ impl MainScreen {
                 "Logout".to_string(),
             ],
             Some(username),
-            Message::SelectedMenuOption,
+            UiMessage::SelectedMenuOption,
         )
         .width(Length::Fill)
         .style(theme);
@@ -250,7 +241,7 @@ impl MainScreen {
             self.room_search_text.as_str(),
             &mut self.rooms_list_state,
             self.rooms_buts_state.as_mut_slice(),
-            Message::RoomChanged,
+            UiMessage::RoomChanged,
             theme,
         );
 
@@ -258,7 +249,7 @@ impl MainScreen {
             &mut self.room_search_box_state,
             "Search rooms...",
             &self.room_search_text,
-            Message::RoomSearchTextChanged,
+            UiMessage::RoomSearchTextChanged,
         )
         .padding(PADDING / 4)
         .size(18)
@@ -266,7 +257,7 @@ impl MainScreen {
         .style(theme);
 
         if let Some(room_id) = first_room_id {
-            room_search = room_search.on_submit(Message::RoomChanged(room_id));
+            room_search = room_search.on_submit(UiMessage::RoomChanged(room_id));
         } else {
             // if first_room_id is None, then that means no room found (either cause of filter, or the user aren't in any room)
             // reusing the room_list variable here
@@ -304,12 +295,12 @@ impl MainScreen {
                 &mut self.composer_state,
                 "Enter your message here...",
                 self.message.as_str(),
-                Message::MessageChanged,
+                UiMessage::MessageChanged,
             )
             .padding((PADDING / 4) * 3)
             .size(MESSAGE_SIZE)
             .style(DarkTextInput)
-            .on_submit(Message::SendMessageComposer(room_id.clone()));
+            .on_submit(UiMessage::SendMessageComposer(room_id.clone()));
 
             let current_user_id = client.current_user_id();
             let displayable_event_count = room.displayable_events().count();
@@ -365,7 +356,7 @@ impl MainScreen {
                 Text::new("↑").size((PADDING / 4) * 3 + MESSAGE_SIZE),
             )
             .style(DarkButton)
-            .on_press(Message::SendFile(room_id.clone()));
+            .on_press(UiMessage::SendFile(room_id.clone()));
 
             let mut bottom_area_widgets = vec![
                 send_file_button.into(),
@@ -382,7 +373,7 @@ impl MainScreen {
                         Text::new("↡").size((PADDING / 4) * 3 + MESSAGE_SIZE),
                     )
                     .style(DarkButton)
-                    .on_press(Message::ScrollToBottom)
+                    .on_press(UiMessage::ScrollToBottom)
                     .into(),
                 );
             }
@@ -431,7 +422,7 @@ impl MainScreen {
             .into()
     }
 
-    pub fn update(&mut self, msg: Message, client: &mut Client) -> Command<super::Message> {
+    pub fn update(&mut self, msg: UiMessage, backend: &mut dyn Backend) -> Command<super::Message> {
         fn make_thumbnail_commands(
             client: &Client,
             thumbnail_urls: Vec<(bool, Uri)>,
@@ -464,7 +455,7 @@ impl MainScreen {
                             },
                             |(result, thumbnail_url)| match result {
                                 Ok(thumbnail) => {
-                                    super::Message::MainScreen(Message::DownloadedThumbnail {
+                                    super::Message::MainScreen(UiMessage::DownloadedThumbnail {
                                         thumbnail,
                                         thumbnail_url,
                                     })
@@ -502,7 +493,7 @@ impl MainScreen {
                             },
                             |result| match result {
                                 Ok((thumbnail_url, raw_data)) => {
-                                    super::Message::MainScreen(Message::DownloadedThumbnail {
+                                    super::Message::MainScreen(UiMessage::DownloadedThumbnail {
                                         thumbnail_url,
                                         thumbnail: ImageHandle::from_memory(raw_data),
                                     })
@@ -529,7 +520,7 @@ impl MainScreen {
         }
 
         match msg {
-            Message::MessageHistoryScrolled {
+            UiMessage::MessageHistoryScrolled {
                 prev_scroll_perc,
                 scroll_perc,
             } => {
@@ -572,7 +563,7 @@ impl MainScreen {
                                     Client::get_events_around(inner, room_id, event_id),
                                     |result| match result {
                                         Ok(response) => super::Message::MainScreen(
-                                            Message::MatrixGetEventsAroundResponse(Box::new(
+                                            UiMessage::MatrixGetEventsAroundResponse(Box::new(
                                                 response,
                                             )),
                                         ),
@@ -604,7 +595,7 @@ impl MainScreen {
                     }
                 }
             }
-            Message::SelectedMenuOption(option) => match option.as_str() {
+            UiMessage::SelectedMenuOption(option) => match option.as_str() {
                 "Logout" => {
                     self.logging_out = Some(false);
                 }
@@ -612,7 +603,7 @@ impl MainScreen {
                 u if u == client.current_user_id().localpart() => println!("bbbbbbbb"),
                 _ => unreachable!(),
             },
-            Message::LogoutConfirmation(confirmation) => {
+            UiMessage::LogoutConfirmation(confirmation) => {
                 if confirmation {
                     self.logging_out = Some(true);
                     let inner = client.inner();
@@ -624,7 +615,7 @@ impl MainScreen {
                     self.logging_out = None;
                 }
             }
-            Message::MessageChanged(new_msg) => {
+            UiMessage::MessageChanged(new_msg) => {
                 self.message = new_msg;
 
                 if let Some(room_id) = self.current_room_id.as_ref() {
@@ -638,19 +629,19 @@ impl MainScreen {
                     );
                 }
             }
-            Message::ScrollToBottom => {
+            UiMessage::ScrollToBottom => {
                 if let Some(room_id) = self.current_room_id.clone() {
                     scroll_to_bottom(self, client, room_id);
                     self.event_history_state.scroll_to_bottom();
                 }
             }
-            Message::DownloadedThumbnail {
+            UiMessage::DownloadedThumbnail {
                 thumbnail_url,
                 thumbnail,
             } => {
                 self.thumbnail_store.put_thumbnail(thumbnail_url, thumbnail);
             }
-            Message::OpenContent {
+            UiMessage::OpenContent {
                 content_url,
                 is_thumbnail,
             } => {
@@ -672,7 +663,7 @@ impl MainScreen {
                             |(content_path, thumbnail)| {
                                 open::that_in_background(content_path);
                                 if let Some((data, thumbnail_url)) = thumbnail {
-                                    super::Message::MainScreen(Message::DownloadedThumbnail {
+                                    super::Message::MainScreen(UiMessage::DownloadedThumbnail {
                                         thumbnail_url,
                                         thumbnail: ImageHandle::from_memory(data),
                                     })
@@ -712,7 +703,7 @@ impl MainScreen {
                                 Ok((content_path, thumbnail)) => {
                                     open::that_in_background(content_path);
                                     if let Some((content_url, raw_data)) = thumbnail {
-                                        super::Message::MainScreen(Message::DownloadedThumbnail {
+                                        super::Message::MainScreen(UiMessage::DownloadedThumbnail {
                                             thumbnail_url: content_url,
                                             thumbnail: ImageHandle::from_memory(raw_data),
                                         })
@@ -726,7 +717,7 @@ impl MainScreen {
                     };
                 }
             }
-            Message::SendMessageComposer(room_id) => {
+            UiMessage::SendMessageComposer(room_id) => {
                 if !self.message.is_empty() {
                     let content =
                         MessageEventContent::text_plain(self.message.drain(..).collect::<String>());
@@ -735,7 +726,7 @@ impl MainScreen {
                     return Command::perform(
                         async move { (content, room_id) },
                         |(content, room_id)| {
-                            super::Message::MainScreen(Message::SendMessage {
+                            super::Message::MainScreen(UiMessage::SendMessage {
                                 content: vec![content],
                                 room_id,
                             })
@@ -743,7 +734,7 @@ impl MainScreen {
                     );
                 }
             }
-            Message::SendFile(room_id) => {
+            UiMessage::SendFile(room_id) => {
                 let file_select_task =
                     tokio::task::spawn_blocking(|| -> Result<Vec<PathBuf>, ClientError> {
                         Ok(rfd::open().map_or_else(|| vec![], |p| vec![p]))
@@ -875,7 +866,7 @@ impl MainScreen {
                     },
                     |result| match result {
                         Ok((content_urls_to_send, room_id)) => {
-                            super::Message::MainScreen(Message::SendMessage {
+                            super::Message::MainScreen(UiMessage::SendMessage {
                                 content: content_urls_to_send
                                     .into_iter()
                                     .map(
@@ -980,14 +971,14 @@ impl MainScreen {
                     },
                 );
             }
-            Message::SendMessage { content, room_id } => {
+            UiMessage::SendMessage { content, room_id } => {
                 if let Some(room) = client.get_room_mut(&room_id) {
                     for content in content {
                         room.add_event(TimelineEvent::new_unacked_message(content, Uuid::new_v4()));
                     }
                 }
             }
-            Message::SendMessageResult(errors) => {
+            UiMessage::SendMessageResult(errors) => {
                 use ruma::{api::client::error::ErrorKind as ClientAPIErrorKind, api::error::*};
                 use ruma_client::Error as InnerClientError;
 
@@ -1011,7 +1002,7 @@ impl MainScreen {
                     }
                 }
             }
-            Message::MatrixSyncResponse(response) => {
+            UiMessage::MatrixSyncResponse(response) => {
                 let thumbnail_urls = client.process_sync_response(*response);
 
                 for (room_id, disp) in client
@@ -1035,11 +1026,11 @@ impl MainScreen {
 
                 return make_thumbnail_commands(&client, thumbnail_urls);
             }
-            Message::MatrixGetEventsAroundResponse(response) => {
+            UiMessage::MatrixGetEventsAroundResponse(response) => {
                 let thumbnail_urls = client.process_events_around_response(*response);
                 return make_thumbnail_commands(&client, thumbnail_urls);
             }
-            Message::RoomChanged(new_room_id) => {
+            UiMessage::RoomChanged(new_room_id) => {
                 if let (Some(disp), Some(disp_at)) = (
                     client
                         .get_room(&new_room_id)
@@ -1053,138 +1044,18 @@ impl MainScreen {
                 }
                 self.current_room_id = Some(new_room_id);
             }
-            Message::RoomSearchTextChanged(new_room_search_text) => {
+            UiMessage::RoomSearchTextChanged(new_room_search_text) => {
                 self.room_search_text = new_room_search_text;
             }
         }
         Command::none()
     }
 
-    pub fn subscription(&self, client: &Client) -> Subscription<super::Message> {
-        let rooms_queued_events = client.rooms_queued_events();
-        let mut sub = Subscription::from_recipe(RetrySendEventRecipe {
-            client: client.inner(),
-            rooms_queued_events,
-        })
-        .map(|result| super::Message::MainScreen(Message::SendMessageResult(result)));
-
-        if let Some(since) = client.next_batch() {
-            sub = Subscription::batch(vec![
-                sub,
-                Subscription::from_recipe(SyncRecipe {
-                    client: client.inner(),
-                    since,
-                })
-                .map(|result| match result {
-                    Ok(response) => {
-                        super::Message::MainScreen(Message::MatrixSyncResponse(Box::from(response)))
-                    }
-                    Err(err) => super::Message::MatrixError(Box::new(err)),
-                }),
-            ]);
-        }
-
-        sub
+    pub fn subscription(&self) -> Subscription<super::Message> {
+        Subscription::none()
     }
 
     pub fn on_error(&mut self, _error_string: String) {
         self.logging_out = None;
-    }
-}
-
-pub type RetrySendEventResult = Vec<(RoomId, Vec<(Uuid, ClientError)>)>;
-pub struct RetrySendEventRecipe {
-    client: InnerClient,
-    rooms_queued_events: Vec<(RoomId, Vec<(Uuid, AnySyncRoomEvent, Option<Duration>)>)>,
-}
-
-impl<H, I> iced_futures::subscription::Recipe<H, I> for RetrySendEventRecipe
-where
-    H: Hasher,
-{
-    type Output = RetrySendEventResult;
-
-    fn hash(&self, state: &mut H) {
-        std::any::TypeId::of::<Self>().hash(state);
-
-        for (id, events) in &self.rooms_queued_events {
-            id.hash(state);
-            for (transaction_id, _, retry_after) in events {
-                transaction_id.hash(state);
-                retry_after.hash(state);
-            }
-        }
-    }
-
-    fn stream(self: Box<Self>, _input: BoxStream<I>) -> BoxStream<Self::Output> {
-        let future = async move {
-            let mut room_errors = Vec::new();
-
-            for (room_id, events) in self.rooms_queued_events {
-                let mut transaction_errors = Vec::new();
-                for (transaction_id, event, retry_after) in events {
-                    if let Some(dur) = retry_after {
-                        tokio::time::delay_for(dur).await;
-                    }
-
-                    let result = match event {
-                        AnySyncRoomEvent::Message(ev) => {
-                            Client::send_message(
-                                self.client.clone(),
-                                ev.content(),
-                                room_id.clone(),
-                                transaction_id,
-                            )
-                            .await
-                        }
-                        _ => unimplemented!(),
-                    };
-
-                    if let Err(e) = result {
-                        transaction_errors.push((transaction_id, e));
-                    }
-                }
-                room_errors.push((room_id, transaction_errors));
-            }
-
-            room_errors
-        };
-
-        Box::pin(iced_futures::futures::stream::once(future))
-    }
-}
-
-pub type SyncResult = Result<sync_events::Response, ClientError>;
-pub struct SyncRecipe {
-    client: InnerClient,
-    since: String,
-}
-
-impl<H, I> iced_futures::subscription::Recipe<H, I> for SyncRecipe
-where
-    H: Hasher,
-{
-    type Output = SyncResult;
-
-    fn hash(&self, state: &mut H) {
-        std::any::TypeId::of::<Self>().hash(state);
-
-        self.since.hash(state);
-        self.client.session().hash(state);
-    }
-
-    fn stream(self: Box<Self>, _input: BoxStream<I>) -> BoxStream<Self::Output> {
-        use iced_futures::futures::TryStreamExt;
-
-        Box::pin(
-            self.client
-                .sync(
-                    None,
-                    self.since,
-                    &PresenceState::Online,
-                    Some(Duration::from_secs(20)),
-                )
-                .map_err(ClientError::Internal),
-        )
     }
 }
