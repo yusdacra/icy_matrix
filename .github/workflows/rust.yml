@@ -1,0 +1,46 @@
+name: Rust
+
+on:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - 'README.md'
+      - '**/*.nix'
+      - 'nix/envrc'
+      - 'flake.lock'
+  pull_request:
+    branches: [ master ]
+    paths-ignore:
+      - 'README.md'
+      - '**/*.nix'
+      - 'nix/envrc'
+      - 'flake.lock'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  all:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+
+    - name: Install dependencies
+      run: |
+        sudo apt update -yy
+    - name: Install rust
+      run: rustup default stable && rustup update && rustup component add clippy
+
+    - name: Cache rust
+      uses: Swatinem/rust-cache@v1
+
+    - name: Check
+      run: cargo check --verbose
+    - name: Clippy
+      uses: actions-rs/clippy-check@v1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build
+      run: cargo build --verbose
